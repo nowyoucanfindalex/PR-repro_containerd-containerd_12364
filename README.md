@@ -17,16 +17,31 @@ Note: opening the FD in read mode (`cat`, `tail -f`) does **not** reproduce the 
 
 ## Prerequisites
 
-- `kubectl` pointing at a cluster running **containerd v2.1.x**
-- Verify: `kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'`
+You need either:
+
+**A) An existing cluster running containerd v2.1.x** (k3s, k0s, RKE2, EKS, etc.)
+
+Verify: `kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'`
+
+**B) Just Docker** — `setup.sh` creates a local kind cluster and injects the buggy shim automatically.
 
 ## Run
+
+### Option A — existing cluster
 
 ```sh
 bash repro.sh
 ```
 
-No cluster setup required — the script applies the pod, waits for the worker to exit, times the delete, and reports the verdict.
+### Option B — no cluster (Docker required)
+
+```sh
+bash setup.sh                              # creates kind cluster, injects shim v2.1.6
+KUBECONFIG=/tmp/shim-wedge-kubeconfig.yaml bash repro.sh
+bash cleanup.sh                            # tears down the cluster when done
+```
+
+`setup.sh` downloads `kind` and `kubectl` automatically if they are not on your PATH.
 
 ## Expected output
 
