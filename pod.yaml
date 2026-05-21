@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shim-wedge
+spec:
+  shareProcessNamespace: true
+  restartPolicy: Never
+  containers:
+
+  # Container A: exits after 5s, leaving an orphan (sleep 30) that holds
+  # the shim's stdout pipe write-end inherited from the container's stdio.
+  - name: worker
+    image: alpine:3.19
+    command: [sh, -c, "sleep 30 & exec sleep 5"]
+    resources:
+      requests: {cpu: 10m, memory: 8Mi}
+
+  # Container B: scans /proc until it finds an orphaned pid, then opens
+  # that pid's fd/1 in write mode (exec 3>).  This gives fd-holder a
+  # write-end reference to the same pipe, from its own cgroup —
+  # outside the reach of cgroup.kill on Container A's cgroup.
+  # When A's cgroup is killed, the orphan's write ref closes; fd-holder's
+  # fd 3 remains open.  The shim's drain loop never sees EOF.
+  - name: fd-holder
+    image: alpine:3.19
+    command:
+    - sh
+    - -c
+    - |
+      PINNED=""
+      while true; do
+        if [ -z "$PINNED" ]; then
+          for dir in /proc/[0-9]*/fd; do
+            pid=${dir%/fd}; pid=${pid#/proc/}
+            [ "$pid" = "$$" ] && continue
+            [ "$pid" = "1" ]  && continue
+            if [ -e "$dir/1" ] && exec 3>"$dir/1" 2>/dev/null; then
+              PINNED=$pid
+              break
+            fi
+          done
+        fi
+        sleep 0.05
+      done
+    resources:
+      requests: {cpu: 10m, memory: 8Mi}
