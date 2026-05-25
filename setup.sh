@@ -96,7 +96,14 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ] && command -v systemctl >/dev/null 2
   DELEGATE_CONF=/etc/systemd/system/docker.service.d/delegate.conf
   NEED_RESTART=false
 
-  if docker info 2>/dev/null | grep -q 'Cgroup Driver: cgroupfs'; then
+  # Print current Docker cgroup state for diagnostics
+  _DI=$(docker info 2>/dev/null)
+  echo "    Docker cgroup driver  : $(echo "$_DI" | grep 'Cgroup Driver' || echo '(unknown)')"
+  echo "    Docker cgroup version : $(echo "$_DI" | grep 'Cgroup Version' || echo '(unknown)')"
+  echo "    Host cgroup version   : $(findmnt -n -o FSTYPE /sys/fs/cgroup 2>/dev/null || echo '(unknown)')"
+
+  # A) systemd cgroup driver — required so containers see cgroupv2 not v1
+  if echo "$_DI" | grep -q 'Cgroup Driver: cgroupfs'; then
     info "Switching Docker cgroup driver to systemd (cgroupv2 host, K8s 1.35+ requirement)..."
     if command -v python3 >/dev/null 2>&1 && [ -s "$DAEMON_JSON" ]; then
       sudo python3 - "$DAEMON_JSON" <<'PYEOF'
@@ -115,6 +122,30 @@ PYEOF
     NEED_RESTART=true
   fi
 
+  # B) host cgroupns mode — Docker 20.10+ defaults to private cgroupns which
+  #    can expose a cgroupv1 view to containers on hybrid-cgroup hosts.
+  #    Setting host mode makes the node container share the host cgroup
+  #    namespace, giving kubelet an unambiguous cgroupv2 view.
+  if ! grep -q 'cgroupns' "$DAEMON_JSON" 2>/dev/null || \
+     ! grep -q '"default-cgroupns-mode".*"host"' "$DAEMON_JSON" 2>/dev/null; then
+    info "Setting Docker cgroupns mode to host..."
+    if command -v python3 >/dev/null 2>&1 && [ -s "$DAEMON_JSON" ]; then
+      sudo python3 - "$DAEMON_JSON" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+try:    d = json.load(open(path))
+except: d = {}
+d['default-cgroupns-mode'] = 'host'
+open(path, 'w').write(json.dumps(d, indent=2) + '\n')
+PYEOF
+    else
+      printf '{"exec-opts":["native.cgroupdriver=systemd"],"default-cgroupns-mode":"host"}\n' \
+        | sudo tee "$DAEMON_JSON" >/dev/null
+    fi
+    NEED_RESTART=true
+  fi
+
+  # C) Delegate=yes — lets kubelet create pod sub-cgroups inside the node
   if ! grep -q 'Delegate=yes' "$DELEGATE_CONF" 2>/dev/null; then
     info "Enabling Docker cgroup delegation (one-time)..."
     sudo mkdir -p "$(dirname "$DELEGATE_CONF")"
@@ -125,6 +156,8 @@ PYEOF
   if [ "$NEED_RESTART" = "true" ]; then
     sudo systemctl daemon-reload && sudo systemctl restart docker
     echo "    done — Docker restarted."
+    echo "    Docker cgroup driver  : $(docker info 2>/dev/null | grep 'Cgroup Driver' || echo '(unknown)')"
+    echo "    Docker cgroup version : $(docker info 2>/dev/null | grep 'Cgroup Version' || echo '(unknown)')"
   fi
 fi
 
