@@ -79,21 +79,52 @@ if [ -z "$KUBECTL" ]; then
   KUBECTL=/tmp/kubectl
 fi
 
-# ── 2. cgroupv2 — Docker cgroup delegation ────────────────────────────────────
-# On cgroupv2 systems (CBL-Mariner, Ubuntu 22+, Fedora 31+) Docker containers
-# do not inherit cgroup controller access (memory, cpu, …) unless the Docker
-# systemd unit has Delegate=yes.  Without it kubelet can't create pod cgroups
-# and never starts, regardless of whether cgroupfs or systemd driver is used.
-# This is a one-time change; it persists across reboots.
+# ── 2. cgroupv2 + Docker cgroup setup ────────────────────────────────────────
+# Two requirements on cgroupv2/systemd hosts (CBL-Mariner, Ubuntu 22+, etc.):
+#
+# A) Docker must use the 'systemd' cgroup driver (not cgroupfs).
+#    With cgroupfs, Docker mounts cgroup v1 hierarchies into containers.
+#    K8s 1.35+ kubelet hard-refuses to start on cgroup v1 with:
+#      "kubelet is configured to not run on a host using cgroup v1"
+#
+# B) Docker's systemd unit needs Delegate=yes so that kubelet can create
+#    pod sub-cgroups inside the node container.
+#
+# Both changes are one-time and persist across reboots.
 if [ -f /sys/fs/cgroup/cgroup.controllers ] && command -v systemctl >/dev/null 2>&1; then
+  DAEMON_JSON=/etc/docker/daemon.json
   DELEGATE_CONF=/etc/systemd/system/docker.service.d/delegate.conf
+  NEED_RESTART=false
+
+  if docker info 2>/dev/null | grep -q 'Cgroup Driver: cgroupfs'; then
+    info "Switching Docker cgroup driver to systemd (cgroupv2 host, K8s 1.35+ requirement)..."
+    if command -v python3 >/dev/null 2>&1 && [ -s "$DAEMON_JSON" ]; then
+      sudo python3 - "$DAEMON_JSON" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+try:    d = json.load(open(path))
+except: d = {}
+opts = [o for o in d.get('exec-opts', []) if 'cgroupdriver' not in o]
+opts.append('native.cgroupdriver=systemd')
+d['exec-opts'] = opts
+open(path, 'w').write(json.dumps(d, indent=2) + '\n')
+PYEOF
+    else
+      printf '{"exec-opts":["native.cgroupdriver=systemd"]}\n' | sudo tee "$DAEMON_JSON" >/dev/null
+    fi
+    NEED_RESTART=true
+  fi
+
   if ! grep -q 'Delegate=yes' "$DELEGATE_CONF" 2>/dev/null; then
-    info "Enabling Docker cgroup delegation (cgroupv2 host — one-time, requires sudo)..."
-    sudo mkdir -p /etc/systemd/system/docker.service.d
+    info "Enabling Docker cgroup delegation (one-time)..."
+    sudo mkdir -p "$(dirname "$DELEGATE_CONF")"
     printf '[Service]\nDelegate=yes\n' | sudo tee "$DELEGATE_CONF" >/dev/null
-    sudo systemctl daemon-reload
-    sudo systemctl restart docker
-    echo "    done"
+    NEED_RESTART=true
+  fi
+
+  if [ "$NEED_RESTART" = "true" ]; then
+    sudo systemctl daemon-reload && sudo systemctl restart docker
+    echo "    done — Docker restarted."
   fi
 fi
 
@@ -102,11 +133,8 @@ info "Creating kind cluster '$CLUSTER' (image: $KIND_IMAGE)..."
 if $KIND get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   echo "    Cluster already exists — skipping"
 else
-  # Use cgroupfs for both containerd and kubelet so that kind works on hosts
-  # where systemd is not PID1 inside the node container (WSL2 without systemd,
-  # LXC, some CI runners).  The two settings must match: if containerd uses
-  # SystemdCgroup=true but kubelet uses cgroupfs (or vice-versa) pods will
-  # not start.  cgroupfs works everywhere; systemd only works with systemd.
+  # Explicitly set systemd cgroup driver on both sides so kubelet and
+  # containerd agree.  Matches the Docker daemon driver set in step 2.
   KIND_CFG=/tmp/kind-cfg-shim-repro.yaml
   cat > "$KIND_CFG" <<'KINDCFG'
 kind: Cluster
@@ -117,12 +145,12 @@ nodes:
   - |
     kind: KubeletConfiguration
     apiVersion: kubelet.config.k8s.io/v1beta1
-    cgroupDriver: cgroupfs
+    cgroupDriver: systemd
 containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-      SystemdCgroup = false
+      SystemdCgroup = true
 KINDCFG
   # --retain keeps the node alive on failure so we can capture kubelet logs.
   if ! $KIND create cluster --name "$CLUSTER" --image "$KIND_IMAGE" --config "$KIND_CFG" --wait 90s --retain; then
