@@ -124,7 +124,20 @@ containerdConfigPatches:
     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
       SystemdCgroup = false
 KINDCFG
-  $KIND create cluster --name "$CLUSTER" --image "$KIND_IMAGE" --config "$KIND_CFG" --wait 90s
+  # --retain keeps the node alive on failure so we can capture kubelet logs.
+  if ! $KIND create cluster --name "$CLUSTER" --image "$KIND_IMAGE" --config "$KIND_CFG" --wait 90s --retain; then
+    echo ""
+    echo "==> Cluster creation failed — kubelet logs from inside the node:"
+    docker exec "${CLUSTER}-control-plane" \
+      journalctl -xeu kubelet --no-pager 2>/dev/null | tail -60 \
+      || docker logs "${CLUSTER}-control-plane" 2>&1 | tail -60 \
+      || echo "    (could not retrieve logs)"
+    echo ""
+    echo "==> Cleaning up failed cluster..."
+    "$KIND" delete cluster --name "$CLUSTER" 2>/dev/null || true
+    rm -f "$KIND_CFG"
+    exit 1
+  fi
   rm -f "$KIND_CFG"
 fi
 
