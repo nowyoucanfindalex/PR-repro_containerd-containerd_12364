@@ -8,7 +8,7 @@ set -euo pipefail
 
 CLUSTER=shim-wedge-repro
 SHIM_VERSION=2.1.6
-KIND_IMAGE=kindest/node:v1.31.0
+KIND_IMAGE=kindest/node:v1.33.0
 KUBECONFIG_OUT=/tmp/shim-wedge-kubeconfig.yaml
 
 info() { echo "==> $*"; }

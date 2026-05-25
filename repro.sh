@@ -13,8 +13,8 @@ kubectl cluster-info >/dev/null 2>&1  || { echo "ERROR: no cluster reachable (ch
 
 RUNTIME=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' 2>/dev/null || echo "unknown")
 echo "    runtime : $RUNTIME"
-echo "$RUNTIME" | grep -q "containerd://2\.1" \
-  || echo "    WARNING: expected containerd://2.1.x — wedge may not fire on other versions"
+echo "$RUNTIME" | grep -q "containerd://2\." \
+  || echo "    WARNING: expected containerd://2.x — wedge may not fire on other versions (got: $RUNTIME)"
 
 # ── 2. Clean slate ────────────────────────────────────────────────────────────
 kubectl delete pod "$POD" -n "$NS" \
