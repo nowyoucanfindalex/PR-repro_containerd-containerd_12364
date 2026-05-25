@@ -8,7 +8,7 @@ set -euo pipefail
 
 CLUSTER=shim-wedge-repro
 SHIM_VERSION=2.1.6
-KIND_IMAGE=kindest/node:v1.33.0
+KIND_IMAGE=kindest/node:v1.35.0
 KUBECONFIG_OUT=/tmp/shim-wedge-kubeconfig.yaml
 
 info() { echo "==> $*"; }
@@ -128,13 +128,30 @@ KINDCFG
   rm -f "$KIND_CFG"
 fi
 
-# ── 4. Inject containerd-shim-runc-v2 v2.1.6 ─────────────────────────────────
-#
-# The bug was introduced in containerd PR #12364 and exists in v2.1.5+.
-# We replace the shim binary in the kind node so the reproducer fires
-# regardless of what version the kind image ships with.
-#
+# ── 4. Verify containerd daemon version ──────────────────────────────────────
+# The bug (PR #12364) lives in the shim but only fires when the containerd
+# daemon passes a context with the handleEventTimeout deadline — behaviour
+# present in 2.1.x, not in 2.0.x.  Fail fast here rather than silently
+# producing a test that always returns NOT REPRODUCED.
 NODE="${CLUSTER}-control-plane"
+CT_VER=$(docker exec "$NODE" containerd --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+if ! echo "$CT_VER" | grep -qE '^v2\.[1-9]'; then
+  echo ""
+  echo "ERROR: containerd ${CT_VER} in node — need v2.1.x or later."
+  echo "  The bug was introduced in v2.1.5; earlier daemons won't trigger it."
+  echo "  Delete this cluster and retry with a newer image:"
+  echo "    $KIND delete cluster --name $CLUSTER"
+  echo "    KIND_IMAGE=kindest/node:v1.36.0 bash setup.sh"
+  echo "  Check available images: https://github.com/kubernetes-sigs/kind/releases"
+  exit 1
+fi
+echo "    containerd daemon: ${CT_VER} ✓"
+
+# ── 5. Inject containerd-shim-runc-v2 v2.1.6 ─────────────────────────────────
+#
+# Replace the shim binary so the reproducer fires on the exact buggy version
+# regardless of what patch the image ships.
+#
 NODE_ARCH=$(docker inspect "$NODE" --format '{{.Architecture}}' 2>/dev/null | tr '[:upper:]' '[:lower:]')
 case "$NODE_ARCH" in amd64|x86_64) NODE_ARCH=amd64;; arm64|aarch64) NODE_ARCH=arm64;; *) echo "ERROR: unknown arch '$NODE_ARCH'"; exit 1;; esac
 
