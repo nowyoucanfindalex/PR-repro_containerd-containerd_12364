@@ -15,18 +15,25 @@ spec:
     resources:
       requests: {cpu: 10m, memory: 8Mi}
 
-  # Container B: scans /proc until it finds an orphaned pid, then opens
-  # that pid's fd/1 in write mode (exec 3>).  This gives fd-holder a
-  # write-end reference to the same pipe, from its own cgroup —
-  # outside the reach of cgroup.kill on Container A's cgroup.
-  # When A's cgroup is killed, the orphan's write ref closes; fd-holder's
+  # Container B: scans /proc until it finds a process from Container A,
+  # then opens that pid's fd/1 in write mode (exec 3>).  This gives
+  # fd-holder a write-end reference to the same pipe, from its own cgroup
+  # — outside the reach of cgroup.kill on Container A's cgroup.
+  # When A's cgroup is killed the orphan's write ref closes; fd-holder's
   # fd 3 remains open.  The shim's drain loop never sees EOF.
+  #
+  # trap '' TERM: SIGTERM (sent by kubelet at pod delete) must not kill
+  # fd-holder before the shim's waitTimeout context expires.  Only SIGKILL
+  # (after the 30s grace period) releases fd 3 — by then waitTimeout has
+  # already fired and the wedge is confirmed.
   - name: fd-holder
     image: alpine:3.19
     command:
     - sh
     - -c
     - |
+      trap '' TERM
+      MY_PIPE=$(readlink /proc/self/fd/1)
       PINNED=""
       while true; do
         if [ -z "$PINNED" ]; then
@@ -34,7 +41,10 @@ spec:
             pid=${dir%/fd}; pid=${pid#/proc/}
             [ "$pid" = "$$" ] && continue
             [ "$pid" = "1" ]  && continue
-            if [ -e "$dir/1" ] && exec 3>"$dir/1" 2>/dev/null; then
+            [ -e "$dir/1" ] || continue
+            # skip processes that share our stdout pipe (fd-holder subprocs)
+            [ "$(readlink "$dir/1" 2>/dev/null)" = "$MY_PIPE" ] && continue
+            if exec 3>"$dir/1" 2>/dev/null; then
               PINNED=$pid
               break
             fi

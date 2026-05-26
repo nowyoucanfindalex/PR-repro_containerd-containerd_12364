@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets up a kind cluster with containerd-shim-runc-v2 v2.1.6 (the buggy version).
+# Sets up a kind cluster pinned to containerd 2.1.6 (the buggy daemon+shim).
 # After this runs, follow the printed instructions to run repro.sh.
 #
 # Requires: docker, curl
@@ -7,8 +7,11 @@
 set -euo pipefail
 
 CLUSTER=shim-wedge-repro
-SHIM_VERSION=2.1.6
-KIND_IMAGE=kindest/node:v1.35.0
+CONTAINERD_VERSION=2.1.6
+# K8s 1.34 ships containerd 2.1.3; we upgrade the daemon to 2.1.6 in-place.
+# K8s 1.34 still accepts cgroup v1 (deprecated, removed in 1.35), so this
+# works on both cgroupv1 and cgroupv2 Linux hosts and on macOS.
+KIND_IMAGE=kindest/node:v1.34.0
 KUBECONFIG_OUT=/tmp/shim-wedge-kubeconfig.yaml
 
 info() { echo "==> $*"; }
@@ -43,11 +46,7 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-# WSL2 without systemd: kind defaults to the systemd cgroup driver, which
-# requires systemd to be PID1 inside the node container.  Without it kubelet
-# never becomes healthy (4-minute silent timeout in kubeadm).
-# The cgroupfs kind config below is the real fix; this block just surfaces
-# the root cause immediately instead of making you wait.
+# WSL2 without systemd: surfaces the root cause rather than a silent 4m timeout.
 if grep -qsi microsoft /proc/version 2>/dev/null; then
   if ! systemctl is-active --quiet systemd 2>/dev/null; then
     echo ""
@@ -79,63 +78,41 @@ if [ -z "$KUBECTL" ]; then
   KUBECTL=/tmp/kubectl
 fi
 
-# ── 2. cgroupv2 requirement ──────────────────────────────────────────────────
-# K8s 1.35+ (the minimum version that ships containerd 2.1.x) hard-refuses to
-# start on cgroup v1.  Fail fast here rather than burning 4 minutes on a
-# cluster that will always die with "kubelet is configured to not run on a
-# host using cgroup v1".
+# ── 2. cgroupv2 note ─────────────────────────────────────────────────────────
+# K8s 1.34 still accepts cgroupv1 (deprecated; hard-refused in 1.35).
+# If the host is cgroupv1 we note it; cluster creation should still succeed.
 if [ "$_OS" = "linux" ] && ! [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   echo ""
-  echo "ERROR: cgroup v2 (unified hierarchy) is not active on this host."
-  echo "  K8s 1.35+ kubelet refuses to start on cgroup v1."
-  echo ""
-  if grep -q 'unified_cgroup_hierarchy=0' /proc/cmdline 2>/dev/null; then
-    echo "  Your kernel cmdline explicitly disables cgroup v2."
-    echo ""
-    if command -v grubby >/dev/null 2>&1; then
-      echo "  Fix (CBL-Mariner / Azure Linux):"
-      echo "    sudo grubby --update-kernel=ALL \\"
-      echo "      --remove-args='systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=yes' \\"
-      echo "      --args='systemd.unified_cgroup_hierarchy=1'"
-    else
-      echo "  Fix: remove 'systemd.unified_cgroup_hierarchy=0' from your kernel cmdline"
-      echo "       and add 'systemd.unified_cgroup_hierarchy=1', then sudo update-grub"
-    fi
+  echo "  NOTE: cgroup v1 detected. K8s 1.34 allows cgroupv1 (with deprecation warnings)."
+  echo "  Proceeding — if cluster creation fails, consider enabling cgroup v2:"
+  if command -v grubby >/dev/null 2>&1; then
+    echo "    sudo grubby --update-kernel=ALL \\"
+    echo "      --remove-args='systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=yes' \\"
+    echo "      --args='systemd.unified_cgroup_hierarchy=1' && sudo reboot"
   else
-    echo "  Fix: add 'systemd.unified_cgroup_hierarchy=1' to your kernel cmdline and reboot."
-    echo "  (Ubuntu 22+ and Fedora 31+ have cgroup v2 by default — likely no change needed)"
+    echo "    Add 'systemd.unified_cgroup_hierarchy=1' to GRUB_CMDLINE_LINUX, then reboot."
   fi
   echo ""
-  echo "  Then reboot and re-run: bash setup.sh"
-  exit 1
 fi
 
 # ── 3. cgroupv2 + Docker cgroup setup ────────────────────────────────────────
-# Two requirements on cgroupv2/systemd hosts (CBL-Mariner, Ubuntu 22+, etc.):
-#
-# A) Docker must use the 'systemd' cgroup driver (not cgroupfs).
-#    With cgroupfs, Docker mounts cgroup v1 hierarchies into containers.
-#    K8s 1.35+ kubelet hard-refuses to start on cgroup v1 with:
-#      "kubelet is configured to not run on a host using cgroup v1"
-#
-# B) Docker's systemd unit needs Delegate=yes so that kubelet can create
-#    pod sub-cgroups inside the node container.
-#
+# On cgroupv2/systemd Linux hosts Docker needs:
+#   A) systemd cgroup driver so containers see cgroupv2 (not a cgroupv1 overlay)
+#   B) Delegate=yes so kubelet can create pod sub-cgroups inside the node
 # Both changes are one-time and persist across reboots.
 if [ -f /sys/fs/cgroup/cgroup.controllers ] && command -v systemctl >/dev/null 2>&1; then
   DAEMON_JSON=/etc/docker/daemon.json
   DELEGATE_CONF=/etc/systemd/system/docker.service.d/delegate.conf
   NEED_RESTART=false
 
-  # Print current Docker cgroup state for diagnostics
   _DI=$(docker info 2>/dev/null)
   echo "    Docker cgroup driver  : $(echo "$_DI" | grep 'Cgroup Driver' || echo '(unknown)')"
   echo "    Docker cgroup version : $(echo "$_DI" | grep 'Cgroup Version' || echo '(unknown)')"
-  echo "    Host cgroup version   : $(findmnt -n -o FSTYPE /sys/fs/cgroup 2>/dev/null || echo '(unknown)')"
+  echo "    Host cgroup fstype    : $(findmnt -n -o FSTYPE /sys/fs/cgroup 2>/dev/null || echo '(unknown)')"
 
-  # A) systemd cgroup driver — required so containers see cgroupv2 not v1
+  # A) systemd cgroup driver
   if echo "$_DI" | grep -q 'Cgroup Driver: cgroupfs'; then
-    info "Switching Docker cgroup driver to systemd (cgroupv2 host, K8s 1.35+ requirement)..."
+    info "Switching Docker cgroup driver to systemd (cgroupv2 host)..."
     if command -v python3 >/dev/null 2>&1 && [ -s "$DAEMON_JSON" ]; then
       sudo python3 - "$DAEMON_JSON" <<'PYEOF'
 import json, sys
@@ -153,12 +130,8 @@ PYEOF
     NEED_RESTART=true
   fi
 
-  # B) host cgroupns mode — Docker 20.10+ defaults to private cgroupns which
-  #    can expose a cgroupv1 view to containers on hybrid-cgroup hosts.
-  #    Setting host mode makes the node container share the host cgroup
-  #    namespace, giving kubelet an unambiguous cgroupv2 view.
-  if ! grep -q 'cgroupns' "$DAEMON_JSON" 2>/dev/null || \
-     ! grep -q '"default-cgroupns-mode".*"host"' "$DAEMON_JSON" 2>/dev/null; then
+  # B) host cgroupns mode — avoids cgroupv1 view on hybrid-cgroup hosts
+  if ! grep -q '"default-cgroupns-mode".*"host"' "$DAEMON_JSON" 2>/dev/null; then
     info "Setting Docker cgroupns mode to host..."
     if command -v python3 >/dev/null 2>&1 && [ -s "$DAEMON_JSON" ]; then
       sudo python3 - "$DAEMON_JSON" <<'PYEOF'
@@ -197,10 +170,18 @@ info "Creating kind cluster '$CLUSTER' (image: $KIND_IMAGE)..."
 if $KIND get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   echo "    Cluster already exists — skipping"
 else
-  # Explicitly set systemd cgroup driver on both sides so kubelet and
-  # containerd agree.  Matches the Docker daemon driver set in step 2.
+  # Use systemd cgroup driver on cgroupv2 Linux; cgroupfs everywhere else
+  # (cgroupv1 Linux, macOS Docker Desktop).  Both drivers must agree between
+  # kubelet and containerd.
   KIND_CFG=/tmp/kind-cfg-shim-repro.yaml
-  cat > "$KIND_CFG" <<'KINDCFG'
+  if [ "$_OS" = "linux" ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    _CGROUP_DRIVER=systemd
+    _SYSTEMD_CGROUP=true
+  else
+    _CGROUP_DRIVER=cgroupfs
+    _SYSTEMD_CGROUP=false
+  fi
+  cat > "$KIND_CFG" <<KINDCFG
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -209,12 +190,12 @@ nodes:
   - |
     kind: KubeletConfiguration
     apiVersion: kubelet.config.k8s.io/v1beta1
-    cgroupDriver: systemd
+    cgroupDriver: ${_CGROUP_DRIVER}
 containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-      SystemdCgroup = true
+      SystemdCgroup = ${_SYSTEMD_CGROUP}
 KINDCFG
   # --retain keeps the node alive on failure so we can capture kubelet logs.
   if ! $KIND create cluster --name "$CLUSTER" --image "$KIND_IMAGE" --config "$KIND_CFG" --wait 90s --retain; then
@@ -233,44 +214,52 @@ KINDCFG
   rm -f "$KIND_CFG"
 fi
 
-# ── 5. Verify containerd daemon version ──────────────────────────────────────
-# The bug (PR #12364) lives in the shim but only fires when the containerd
-# daemon passes a context with the handleEventTimeout deadline — behaviour
-# present in 2.1.x, not in 2.0.x.  Fail fast here rather than silently
-# producing a test that always returns NOT REPRODUCED.
+# Export kubeconfig now so kubectl is available during recovery wait below.
+$KIND get kubeconfig --name "$CLUSTER" > "$KUBECONFIG_OUT"
+
+# ── 5. Upgrade containerd daemon+shim to v2.1.6 ──────────────────────────────
+# The bug requires the daemon to propagate the handleEventTimeout context to
+# the shim over ttrpc — behaviour introduced in PR #12364 (v2.1.5+).
+# The kind image ships 2.1.3; we patch-upgrade to 2.1.6 in-place.
+# Same minor version → compatible config and CRI API.
 NODE="${CLUSTER}-control-plane"
-CT_VER=$(docker exec "$NODE" containerd --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-if ! echo "$CT_VER" | grep -qE '^v2\.[1-9]'; then
+NODE_ARCH=$(docker exec "$NODE" uname -m 2>/dev/null | tr '[:upper:]' '[:lower:]')
+case "$NODE_ARCH" in amd64|x86_64) NODE_ARCH=amd64;; arm64|aarch64) NODE_ARCH=arm64;; *) echo "ERROR: could not detect node arch (got: '${NODE_ARCH}')"; exit 1;; esac
+
+info "Upgrading containerd daemon+shim to v${CONTAINERD_VERSION} (${NODE_ARCH})..."
+_URL="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${NODE_ARCH}.tar.gz"
+curl -fsSL "$_URL" | tar xz -C /tmp --strip-components=1 bin/containerd bin/containerd-shim-runc-v2
+
+docker exec "$NODE" systemctl stop containerd
+docker cp /tmp/containerd "${NODE}:/usr/local/bin/containerd"
+docker cp /tmp/containerd-shim-runc-v2 "${NODE}:/usr/local/bin/containerd-shim-runc-v2"
+docker exec "$NODE" chmod +x /usr/local/bin/containerd /usr/local/bin/containerd-shim-runc-v2
+rm -f /tmp/containerd /tmp/containerd-shim-runc-v2
+docker exec "$NODE" systemctl start containerd
+
+echo "    Waiting for control-plane to recover (up to 90s)..."
+_OK=false
+for _i in $(seq 18); do
+  sleep 5
+  $KUBECTL --kubeconfig "$KUBECONFIG_OUT" get nodes >/dev/null 2>&1 && { _OK=true; break; }
+done
+[ "$_OK" = true ] || { echo "ERROR: API server did not recover after containerd restart"; exit 1; }
+$KUBECTL --kubeconfig "$KUBECONFIG_OUT" wait node --all --for=condition=Ready --timeout=30s >/dev/null 2>&1 || true
+
+# ── 6. Verify containerd daemon version ──────────────────────────────────────
+# Confirms the upgrade landed and that the bug-triggering behaviour is present.
+CT_VER=$(docker exec "$NODE" containerd --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+if ! echo "$CT_VER" | grep -qE '^v2\.1\.'; then
   echo ""
-  echo "ERROR: containerd ${CT_VER} in node — need v2.1.x or later."
-  echo "  The bug was introduced in v2.1.5; earlier daemons won't trigger it."
-  echo "  Delete this cluster and retry with a newer image:"
-  echo "    $KIND delete cluster --name $CLUSTER"
-  echo "    KIND_IMAGE=kindest/node:v1.36.0 bash setup.sh"
-  echo "  Check available images: https://github.com/kubernetes-sigs/kind/releases"
+  echo "ERROR: containerd ${CT_VER} in node — need v2.1.x."
+  echo "  The bug was introduced in PR #12364 (v2.1.5) and fixed in v2.2.0."
+  echo "  v2.0.x daemons never trigger it; v2.2.0+ have it patched."
   exit 1
 fi
 echo "    containerd daemon: ${CT_VER} ✓"
+echo "    containerd shim:   $(docker exec "$NODE" /usr/local/bin/containerd-shim-runc-v2 -v 2>&1 | grep Version | awk '{print $2}')"
 
-# ── 6. Inject containerd-shim-runc-v2 v2.1.6 ─────────────────────────────────
-#
-# Replace the shim binary so the reproducer fires on the exact buggy version
-# regardless of what patch the image ships.
-#
-NODE_ARCH=$(docker inspect "$NODE" --format '{{.Architecture}}' 2>/dev/null | tr '[:upper:]' '[:lower:]')
-case "$NODE_ARCH" in amd64|x86_64) NODE_ARCH=amd64;; arm64|aarch64) NODE_ARCH=arm64;; *) echo "ERROR: unknown arch '$NODE_ARCH'"; exit 1;; esac
-
-info "Injecting containerd-shim-runc-v2 v${SHIM_VERSION} (${NODE_ARCH})..."
-URL="https://github.com/containerd/containerd/releases/download/v${SHIM_VERSION}/containerd-${SHIM_VERSION}-linux-${NODE_ARCH}.tar.gz"
-curl -fsSL "$URL" | tar xz -C /tmp --strip-components=1 bin/containerd-shim-runc-v2
-docker cp /tmp/containerd-shim-runc-v2 "${NODE}:/usr/local/bin/containerd-shim-runc-v2"
-docker exec "$NODE" chmod +x /usr/local/bin/containerd-shim-runc-v2
-rm -f /tmp/containerd-shim-runc-v2
-
-echo "    $(docker exec "$NODE" /usr/local/bin/containerd-shim-runc-v2 -version 2>&1 | head -1)"
-
-# ── 7. Export kubeconfig ──────────────────────────────────────────────────────
-$KIND get kubeconfig --name "$CLUSTER" > "$KUBECONFIG_OUT"
+# ── 7. Export kubeconfig (final path printed for user) ───────────────────────
 echo "    kubeconfig: $KUBECONFIG_OUT"
 
 echo ""
