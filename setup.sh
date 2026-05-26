@@ -79,7 +79,38 @@ if [ -z "$KUBECTL" ]; then
   KUBECTL=/tmp/kubectl
 fi
 
-# ── 2. cgroupv2 + Docker cgroup setup ────────────────────────────────────────
+# ── 2. cgroupv2 requirement ──────────────────────────────────────────────────
+# K8s 1.35+ (the minimum version that ships containerd 2.1.x) hard-refuses to
+# start on cgroup v1.  Fail fast here rather than burning 4 minutes on a
+# cluster that will always die with "kubelet is configured to not run on a
+# host using cgroup v1".
+if [ "$_OS" = "linux" ] && ! [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  echo ""
+  echo "ERROR: cgroup v2 (unified hierarchy) is not active on this host."
+  echo "  K8s 1.35+ kubelet refuses to start on cgroup v1."
+  echo ""
+  if grep -q 'unified_cgroup_hierarchy=0' /proc/cmdline 2>/dev/null; then
+    echo "  Your kernel cmdline explicitly disables cgroup v2."
+    echo ""
+    if command -v grubby >/dev/null 2>&1; then
+      echo "  Fix (CBL-Mariner / Azure Linux):"
+      echo "    sudo grubby --update-kernel=ALL \\"
+      echo "      --remove-args='systemd.unified_cgroup_hierarchy=0 systemd.legacy_systemd_cgroup_controller=yes' \\"
+      echo "      --args='systemd.unified_cgroup_hierarchy=1'"
+    else
+      echo "  Fix: remove 'systemd.unified_cgroup_hierarchy=0' from your kernel cmdline"
+      echo "       and add 'systemd.unified_cgroup_hierarchy=1', then sudo update-grub"
+    fi
+  else
+    echo "  Fix: add 'systemd.unified_cgroup_hierarchy=1' to your kernel cmdline and reboot."
+    echo "  (Ubuntu 22+ and Fedora 31+ have cgroup v2 by default — likely no change needed)"
+  fi
+  echo ""
+  echo "  Then reboot and re-run: bash setup.sh"
+  exit 1
+fi
+
+# ── 3. cgroupv2 + Docker cgroup setup ────────────────────────────────────────
 # Two requirements on cgroupv2/systemd hosts (CBL-Mariner, Ubuntu 22+, etc.):
 #
 # A) Docker must use the 'systemd' cgroup driver (not cgroupfs).
@@ -161,7 +192,7 @@ PYEOF
   fi
 fi
 
-# ── 3. Create kind cluster ────────────────────────────────────────────────────
+# ── 4. Create kind cluster ────────────────────────────────────────────────────
 info "Creating kind cluster '$CLUSTER' (image: $KIND_IMAGE)..."
 if $KIND get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   echo "    Cluster already exists — skipping"
@@ -202,7 +233,7 @@ KINDCFG
   rm -f "$KIND_CFG"
 fi
 
-# ── 4. Verify containerd daemon version ──────────────────────────────────────
+# ── 5. Verify containerd daemon version ──────────────────────────────────────
 # The bug (PR #12364) lives in the shim but only fires when the containerd
 # daemon passes a context with the handleEventTimeout deadline — behaviour
 # present in 2.1.x, not in 2.0.x.  Fail fast here rather than silently
@@ -221,7 +252,7 @@ if ! echo "$CT_VER" | grep -qE '^v2\.[1-9]'; then
 fi
 echo "    containerd daemon: ${CT_VER} ✓"
 
-# ── 5. Inject containerd-shim-runc-v2 v2.1.6 ─────────────────────────────────
+# ── 6. Inject containerd-shim-runc-v2 v2.1.6 ─────────────────────────────────
 #
 # Replace the shim binary so the reproducer fires on the exact buggy version
 # regardless of what patch the image ships.
@@ -238,7 +269,7 @@ rm -f /tmp/containerd-shim-runc-v2
 
 echo "    $(docker exec "$NODE" /usr/local/bin/containerd-shim-runc-v2 -version 2>&1 | head -1)"
 
-# ── 5. Export kubeconfig ──────────────────────────────────────────────────────
+# ── 7. Export kubeconfig ──────────────────────────────────────────────────────
 $KIND get kubeconfig --name "$CLUSTER" > "$KUBECONFIG_OUT"
 echo "    kubeconfig: $KUBECONFIG_OUT"
 
