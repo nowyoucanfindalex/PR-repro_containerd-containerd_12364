@@ -30,7 +30,7 @@ sleep 8
 
 # ── 4. Time the delete ────────────────────────────────────────────────────────
 echo ""
-echo "==> Deleting pod (stock shim stalls ~10-25s; patched exits in <4s)..."
+echo "==> Deleting pod (buggy shim stalls until SIGKILL ~30s+; patched exits in <2s)..."
 START=$SECONDS
 kubectl delete pod "$POD" -n "$NS" --grace-period=30 --timeout=90s
 ELAPSED=$((SECONDS - START))
@@ -48,8 +48,9 @@ if [ "$ELAPSED" -ge 9 ]; then
 else
   echo "RESULT: NOT REPRODUCED (delete took ${ELAPSED}s)"
   echo ""
-  echo "Possible reasons:"
-  echo "  - Patched shim already installed (PR #13378 merged)"
+  echo "If this was against setup-patched.sh: this is the EXPECTED result — fix verified."
+  echo ""
+  echo "If this was against setup.sh (buggy cluster), possible reasons:"
   echo "  - containerd version is not 2.1.x (got: $RUNTIME)"
   echo "  - fd-holder did not pin the FD in time — try running again"
   exit 1
